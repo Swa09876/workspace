@@ -125,7 +125,7 @@ def resolve_batch_name(cfg: dict) -> str:
 
 
 def render_visualization(image_bgr, results, names: dict, out_path: Path) -> None:
-    """Draw boxes + labels onto a copy of the image."""
+    """Draw segmentation masks onto a copy of the image."""
     annotated = image_bgr.copy()
 
     # Prefer segmentation masks if available
@@ -140,13 +140,11 @@ def render_visualization(image_bgr, results, names: dict, out_path: Path) -> Non
                 masks = None
 
         if masks is not None and len(masks) > 0:
-            # masks shape: (N, H, W) boolean or 0/1
             cls_ids = results.boxes.cls.cpu().numpy().astype(int) if results.boxes is not None else [0] * len(masks)
             h, w = annotated.shape[:2]
             overlay = np.zeros((h, w, 3), dtype=np.uint8)
             for mask, cls_id in zip(masks, cls_ids):
                 color = _COLOR_PALETTE[cls_id % len(_COLOR_PALETTE)]
-                # Ensure mask matches original image size (H,W)
                 mh, mw = mask.shape[:2]
                 if (mh, mw) != (h, w):
                     mask_uint8 = (mask.astype('uint8') * 255) if mask.dtype != np.uint8 else mask
@@ -155,28 +153,32 @@ def render_visualization(image_bgr, results, names: dict, out_path: Path) -> Non
                 else:
                     mask_bool = mask.astype(bool) if mask.dtype != np.bool_ else mask
                 overlay[mask_bool] = color
-            # blend
+            # Blend mask overlay onto original image
             cv2.addWeighted(overlay, 0.5, annotated, 0.5, 0, annotated)
-            # optional: put class labels at top-left of each mask bbox
+
+            # Put small class label tag near mask centroid
             try:
-                boxes = results.boxes.xyxy.cpu().numpy()
-                confs = results.boxes.conf.cpu().numpy()
-                for (x1, y1, x2, y2), conf, cls_id in zip(boxes, confs, cls_ids):
-                    x1, y1, x2, y2 = (int(v) for v in (x1, y1, x2, y2))
+                confs = results.boxes.conf.cpu().numpy() if results.boxes is not None else [1.0] * len(masks)
+                boxes = results.boxes.xyxy.cpu().numpy() if results.boxes is not None else []
+                for idx, (conf, cls_id) in enumerate(zip(confs, cls_ids)):
+                    if idx < len(boxes):
+                        x1, y1 = int(boxes[idx][0]), int(boxes[idx][1])
+                    else:
+                        x1, y1 = 10, 10 + idx * 20
                     label = f"{names.get(int(cls_id), cls_id)} {conf:.2f}"
-                    text_w = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0][0]
                     color = _COLOR_PALETTE[int(cls_id) % len(_COLOR_PALETTE)]
-                    cv2.rectangle(annotated, (x1, y1 - 18), (x1 + text_w + 6, y1), color, -1)
+                    text_w = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)[0][0]
+                    cv2.rectangle(annotated, (max(0, x1), max(0, y1 - 15)), (max(0, x1) + text_w + 6, max(0, y1)), color, -1)
                     cv2.putText(
-                        annotated, label, (x1 + 3, y1 - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA,
+                        annotated, label, (max(0, x1) + 3, max(0, y1 - 4)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA,
                     )
             except Exception:
                 pass
             cv2.imwrite(str(out_path), annotated)
             return
 
-    # Fallback to bounding boxes if masks not available
+    # Fallback if masks not available
     if results is None or results.boxes is None or len(results.boxes) == 0:
         cv2.imwrite(str(out_path), image_bgr)
         return
@@ -199,11 +201,10 @@ def render_visualization(image_bgr, results, names: dict, out_path: Path) -> Non
 
 def annotate_image(model, image_path: Path, cfg: dict, dirs: dict, names: dict) -> dict:
     """
-    Run inference on one image and persist the YOLO label file, image copy
-    and (optional) visualization. Returns a record dict for the upload phase.
+    Run inference on one image and persist the YOLO label file (polygon mask format),
+    image copy and (optional) visualization. Returns a record dict for the upload phase.
     """
     m_cfg = cfg["model"]
-    out_cfg = cfg["output"]
 
     results = model.predict(
         source=str(image_path),
@@ -218,58 +219,41 @@ def annotate_image(model, image_path: Path, cfg: dict, dirs: dict, names: dict) 
     mask_path = None
     stem = image_path.stem
     image_out = dirs["images"] / image_path.name
-
-    # Save YOLO bbox labels for upload, and optionally save masks for local visualization.
     label_path = dirs["labels"] / f"{stem}.txt"
+
+    # Extract polygon segmentation masks for YOLO segmentation format
     if results.boxes is not None and len(results.boxes) > 0:
         cls_ids = results.boxes.cls.cpu().numpy().astype(int)
         confs = results.boxes.conf.cpu().numpy()
-        xywhn = results.boxes.xywhn.cpu().numpy()
-        detections = [
-            {
-                "class_id": int(cls_id),
-                "conf": float(conf),
-                "xywhn": [float(v) for v in box],
-            }
-            for cls_id, conf, box in zip(cls_ids, confs, xywhn)
-        ]
+
+        if hasattr(results, "masks") and results.masks is not None and hasattr(results.masks, "xyn") and len(results.masks.xyn) > 0:
+            polygons_xyn = results.masks.xyn
+            for cls_id, conf, poly in zip(cls_ids, confs, polygons_xyn):
+                if len(poly) >= 3:  # Polygon requires at least 3 points
+                    poly_flat = poly.flatten().tolist()
+                    detections.append({
+                        "class_id": int(cls_id),
+                        "conf": float(conf),
+                        "polygon": [float(v) for v in poly_flat],
+                    })
+        else:
+            # Fallback to bbox if masks unavailable
+            xywhn = results.boxes.xywhn.cpu().numpy()
+            for cls_id, conf, box in zip(cls_ids, confs, xywhn):
+                detections.append({
+                    "class_id": int(cls_id),
+                    "conf": float(conf),
+                    "xywhn": [float(v) for v in box],
+                })
 
     with open(label_path, "w", encoding="utf-8") as fh:
         for det in detections:
-            cx, cy, w, h = det["xywhn"]
-            fh.write(f"{det['class_id']} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n")
-
-    # Try to extract segmentation masks for local visualization only
-    if hasattr(results, "masks") and results.masks is not None:
-        masks = None
-        try:
-            masks = results.masks.data.cpu().numpy()
-        except Exception:
-            try:
-                masks = results.masks.cpu().numpy()
-            except Exception:
-                masks = None
-
-        if masks is not None and len(masks) > 0:
-            img = cv2.imread(str(image_path))
-            h, w = img.shape[:2]
-            combined = np.zeros((h, w), dtype=np.uint8)
-            cls_ids = results.boxes.cls.cpu().numpy().astype(int) if results.boxes is not None else [0] * len(masks)
-            for mask, cls_id in zip(masks, cls_ids):
-                mh, mw = mask.shape[:2]
-                if (mh, mw) != (h, w):
-                    mask_uint8 = (mask.astype('uint8') * 255) if mask.dtype != np.uint8 else mask
-                    mask_resized = cv2.resize(mask_uint8, (w, h), interpolation=cv2.INTER_NEAREST)
-                    mask_bool = mask_resized.astype(bool)
-                else:
-                    mask_bool = mask.astype(bool) if mask.dtype != np.bool_ else mask
-                combined[mask_bool] = int(cls_id) + 1
-            mask_path = dirs["labels"] / f"{stem}.png"
-            cv2.imwrite(str(mask_path), combined)
-        else:
-            mask_path = None
-    else:
-        mask_path = None
+            if "polygon" in det:
+                poly_str = " ".join(f"{v:.6f}" for v in det["polygon"])
+                fh.write(f"{det['class_id']} {poly_str}\n")
+            elif "xywhn" in det:
+                cx, cy, w, h = det["xywhn"]
+                fh.write(f"{det['class_id']} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n")
 
     if image_path.resolve() != image_out.resolve():
         shutil_copy(image_path, image_out)
@@ -315,13 +299,14 @@ def upload_image(project, record: dict, cfg: dict, class_map: dict) -> dict:
         else:
             ann_to_send = ann_path
 
-        project.upload(
-            str(record["image_path"]),
+        project.single_upload(
+            image_path=str(record["image_path"]),
             annotation_path=str(ann_to_send),
-            class_map=class_map,
-            num_retries=r_cfg.get("num_retries", 3),
+            annotation_labelmap=class_map,
+            split=r_cfg.get("split", "train"),
+            num_retry_uploads=r_cfg.get("num_retries", 3),
             batch_name=r_cfg.get("batch_name", "auto_annotated"),
-            overwrite=r_cfg.get("overwrite", False),
+            annotation_overwrite=r_cfg.get("overwrite", True),
         )
         return {"image_path": record["image_path"], "status": "uploaded"}
     except Exception as exc:  # noqa: BLE001 - report every failure, keep going
@@ -505,3 +490,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+

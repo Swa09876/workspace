@@ -168,8 +168,6 @@
 !/data/annotated/.gitkeep
 !/data/log/.gitkeep
 
-# YOLO model weights
-*.pt
 
 # Ultralytics
 /runs/
