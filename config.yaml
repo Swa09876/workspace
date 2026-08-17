@@ -7,7 +7,7 @@ model:
   # yolov11n.pt) or a path to a custom trained model (e.g. runs/train/exp/weights/best.pt).
   # If the file does not exist locally, ultralytics will auto-download it.
   # Updated to use the provided custom weights (relative to workspace)
-  path: YOLO_tiled_model/yolo-segmentation-model/weights/best.pt
+  path: C:/Users/Alex/Desktop/workspace1/workspace/runs1/clay_tile/weights/best.pt
   # Minimum confidence to keep a detection (0.0 - 1.0)
   conf_threshold: 0.25
   # IoU threshold used by NMS (0.0 - 1.0)
@@ -49,11 +49,11 @@ roboflow:
   # Roboflow workspace ID (e.g. "my-workspace")
   workspace: "swayams-workspace-ef5rt"
   # Roboflow project ID (e.g. "my-project")
-  project: "uamtec1"
+  project: "uamtec_clay_tile"
   # Master toggle: set false to only annotate locally, or use --dry-run
   upload_enabled: true
   # Name of the batch shown in Roboflow (grouping for this run)
-  batch_name: auto_annotated_5
+  batch_name: auto_annotated_batch_1
   # Number of upload retries per image on failure
   num_retries: 3
   # Number of parallel upload workers (the "parallel" part of the pipeline)
